@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/PolarisSurface.cpp
++++ b/iokit/Kernel/arm/PolarisSurface.cpp
+@@ -407,7 +407,7 @@
+ 	OSArray *fRefs;
+ 
+ 	PolarisSurfaceRef *findRef(uint32_t id, unsigned int *index);
+-	IOReturn addRef(PolarisSurface *s, PolarisSurfaceRef **refOut);
++	IOReturn addRef(PolarisSurface *s, PolarisSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(PolarisSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+ 
+@@ -495,17 +495,25 @@
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it instead
++ * made the framework build a second client for the same id; releasing that
++ * one (traps 4 + 5) unmapped the memory under the first (backboardd
++ * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(PolarisSurface *s, PolarisSurfaceRef **refOut)
++IOSurfaceRootUserClient::addRef(PolarisSurface *s, PolarisSurfaceRef **refOut, bool *existing)
+ {
++	*existing = false;
+ 	IOLockLock(fLock);
+ 	PolarisSurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
+-		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		polaris_surface_put(s);
+ 		*refOut = ref;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+@@ -615,7 +623,8 @@
+ IOSurfaceRootUserClient::returnSurface(PolarisSurface *s, IOExternalMethodArguments *args)
+ {
+ 	PolarisSurfaceRef *ref = NULL;
+-	IOReturn ret = addRef(s, &ref);
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+@@ -624,10 +633,13 @@
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		polaris_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
+ 		ret = polaris_struct_out(args, out, POLARIS_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, POLARIS_SURFACE_RESULT_SIZE);
+ 	}
+-	if (ret != kIOReturnSuccess) {
++	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}

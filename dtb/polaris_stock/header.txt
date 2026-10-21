@@ -1,0 +1,16 @@
+kernel_size: 28177346
+kernel_addr: 0x8000
+ramdisk_size: 3176448
+ramdisk_addr: 0x1000000
+second_size: 0
+tags_addr: 0x100
+page_size: 4096
+header_version: 1
+os_version: 0x200001a2
+name: 
+cmdline: console=ttyMSM0,115200n8 androidboot.hardware=qcom androidboot.console=ttyMSM0 msm_rtb.filter=0x237 ehci-hcd.park=3 service_locator.enable=1 swiotlb=2048 androidboot.configfs=true loop.max_part=7 androidboot.usbcontroller=a600000.dwc3 androidboot.boot_devices=soc/1d84000.ufshc cgroup_disable=pressure androidboot.selinux=permissive
+header_size: 1648
+kernel_offset: 4096
+ramdisk_offset: 28184576
+second_offset: 31363072
+recovery_dtbo_offset: 31363072

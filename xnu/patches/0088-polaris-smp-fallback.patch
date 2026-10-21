@@ -1,0 +1,82 @@
+diff --git a/iokit/Kernel/arm/PolarisCPU.cpp b/iokit/Kernel/arm/PolarisCPU.cpp
+--- a/iokit/Kernel/arm/PolarisCPU.cpp
++++ b/iokit/Kernel/arm/PolarisCPU.cpp
+@@ -148,22 +148,38 @@
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("POLARIS CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
++	uint32_t skipped = 0;
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		PolarisCPU *cpu = __atomic_load_n(&polaris_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
++		bool alive = true;
++
+ 		if (kr != KERN_SUCCESS) {
+-			panic("POLARIS CPU: cpu=%u processor_start failed: %d", i, kr);
++			/*
++			 * The A75 cluster can refuse to power up, and PSCI reports it
++			 * here. Panicking would take the whole system down over cores
++			 * that are optional, so skip the CPU and keep the boot.
++			 */
++			IOLog("POLARIS CPU: cpu=%u processor_start failed: %d; skipping\n",
++			    i, kr);
++			++skipped;
++			continue;
+ 		}
+ 		/* processor_start() is asynchronous for secondaries in this XNU. */
+ 		nanoseconds_to_deadline(5 * NSEC_PER_SEC, &deadline);
+ 		while (__atomic_load_n(&cpu->initialized, __ATOMIC_ACQUIRE) == 0 ||
+ 		    !polaris_cpu_signal_is_enabled(i)) {
+ 			if (mach_absolute_time() > deadline) {
+-				IOLog("POLARIS CPU: cpu=%u mpidr=0x%x NOT alive after 5s\n",
+-				    i, topology->cpus[i].phys_id);
+-				panic("POLARIS CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
++				alive = false;
++				break;
+ 			}
+ 			IOSleep(1);
++		}
++		if (!alive) {
++			IOLog("POLARIS CPU: cpu=%u mpidr=0x%x NOT alive after 5s; skipping\n",
++			    i, topology->cpus[i].phys_id);
++			++skipped;
++			continue;
+ 		}
+ 		IOLog("POLARIS CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
+@@ -173,8 +189,14 @@
+ 	__atomic_load_n(&polaris_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+-	ml_set_max_cpus(topology->max_cpu_id + 1);
++	/*
++	 * Only the CPUs that actually started may be handed to the scheduler:
++	 * max_cpu_id + 1 would advertise the skipped ones as well, and a thread
++	 * dispatched to a core that never came up simply never runs.
++	 */
++	ml_set_max_cpus(topology->num_cpus - skipped);
+-	IOLog("POLARIS CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	IOLog("POLARIS CPU: %u/%u CPUs initialized, SGI1 verified%s\n",
++	    topology->num_cpus - skipped, topology->num_cpus,
++	    skipped != 0 ? " (degraded, some cores are down)" : "");
+ 	thread_terminate(current_thread());
+ }
+ 
+@@ -244,9 +266,15 @@
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = polaris_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
+ 	IOLog("POLARIS CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+-	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
++	/*
++	 * cpu_start() discards PE_cpu_start's return, so a refusal has to be
++	 * reported here and handled by startAll(). Returning an error keeps the
++	 * boot alive: a core that PSCI will not power is not fatal.
++	 */
+ 	if (rc != 0) {
+-		panic("POLARIS CPU: cpu=%u NOT alive: PSCI CPU_ON rc=%d", getCPUNumber(), rc);
++		IOLog("POLARIS CPU: cpu=%u PSCI CPU_ON refused rc=%d; startAll decides\n",
++		    getCPUNumber(), rc);
++		return KERN_FAILURE;
+ 	}
+ 	return KERN_SUCCESS;
+ }

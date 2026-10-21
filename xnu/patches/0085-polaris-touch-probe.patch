@@ -1,0 +1,89 @@
+diff --git a/bsd/dev/polaris_touch.c b/bsd/dev/polaris_touch.c
+--- a/bsd/dev/polaris_touch.c
++++ b/bsd/dev/polaris_touch.c
+@@ -32,6 +32,22 @@
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++
++/*
++ * polaris (Mi MIX 2S, SDM845). The touchscreen is a Synaptics DSX S3330 on
++ * qupv3_se14, not a Goodix/Focaltech: /soc/i2c@a98000, address 0x20, IRQ on
++ * TLMM gpio125, reset on gpio99, SDA/SCL on gpio33/gpio34 muxed to qup14.
++ * Everything below is read-only: it only reports what the bootloader left in
++ * the SE14, the wrapper1 clocks and the pins, so the driver can be written
++ * against evidence instead of a guess.
++ */
++#define TOUCH_POLARIS_SE_PA    0x00a98000u
++#define TOUCH_POLARIS_TLMM_PA  0x03400000u
++#define TOUCH_POLARIS_RCG_BASE 0x18000u  /* wrapper1, per-SE stride 0x100 */
++#define TOUCH_POLARIS_SDA      33u
++#define TOUCH_POLARIS_SCL      34u
++#define TOUCH_POLARIS_RESET    99u
++#define TOUCH_POLARIS_IRQ      125u
+ /* GT9896 is Yellowstone in Xiaomi polaris-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -545,6 +561,51 @@
+ 	return true;
+ }
+ 
++static bool
++touch_is_polaris(void)
++{
++	int polaris = 0;
++	(void)PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
++	return polaris != 0;
++}
++
++static void
++touch_polaris_probe(void)
++{
++	vm_offset_t gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
++	/* Pins 33/34/99 sit in the NORTH tile, pin 125 in EAST. */
++	vm_offset_t north = ml_io_map(0x03900000u, 0x80000);
++	vm_offset_t east = ml_io_map(0x03500000u, 0x80000);
++	vm_offset_t se = ml_io_map(TOUCH_POLARIS_SE_PA, 0x4000);
++	uint32_t fw;
++
++	printf("POLARIS TOUCH: polaris SE14 at %#x, TLMM north at 0x3900000\n",
++	    TOUCH_POLARIS_SE_PA);
++	if (!gcc || !north || !east || !se) {
++		printf("POLARIS TOUCH: polaris mapping failed gcc=%d n=%d e=%d se=%d\n",
++		    gcc != 0, north != 0, east != 0, se != 0);
++		return;
++	}
++	fw = touch_rd(se, SE_FW);
++	printf("POLARIS TOUCH: polaris se14 fw=%#x proto=%u fw-valid=%u status=%#x "
++	    "hw_tx=%#x hw_rx=%#x ios=%#x\n",
++	    fw, (fw >> 8) & 0xffu, !(touch_rd(se, 0x64) & 1u),
++	    touch_rd(se, SE_STATUS), touch_rd(se, SE_HW_TX), touch_rd(se, SE_HW_RX),
++	    touch_rd(se, 0x908));
++	/* gcc_qupv3_wrap1_s6_clk_src: cmd_rcgr 0x18738, branch bit 28 of 0x5200c. */
++	printf("POLARIS TOUCH: polaris s6 cmd=%#x cfg=%#x halt=%#x en=%#x\n",
++	    touch_rd(gcc, 0x18738), touch_rd(gcc, 0x1873cu),
++	    touch_rd(gcc, 0x18734), touch_rd(gcc, 0x5200cu));
++	printf("POLARIS TOUCH: polaris gpio33 cfg=%#x io=%#x gpio34 cfg=%#x io=%#x "
++	    "gpio99 cfg=%#x io=%#x\n",
++	    touch_rd(north, TOUCH_GPIO_CFG(33)), touch_rd(north, TOUCH_GPIO_IO(33)),
++	    touch_rd(north, TOUCH_GPIO_CFG(34)), touch_rd(north, TOUCH_GPIO_IO(34)),
++	    touch_rd(north, TOUCH_GPIO_CFG(99)), touch_rd(north, TOUCH_GPIO_IO(99)));
++	printf("POLARIS TOUCH: polaris gpio125 cfg=%#x io=%#x\n",
++	    touch_rd(east, TOUCH_GPIO_CFG(125)), touch_rd(east, TOUCH_GPIO_IO(125)));
++	printf("POLARIS TOUCH: polaris probe done; DSX transfers not attempted yet\n");
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -558,6 +619,10 @@
+ 	(void)PE_parse_boot_argn("polaristouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("POLARIS TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
++	if (touch_is_polaris()) {
++		touch_polaris_probe();
++		goto out;
++	}
+ 	printf("POLARIS TOUCH: mapping GCC/TLMM/SE7\n");
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);

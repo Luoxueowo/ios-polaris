@@ -1,0 +1,143 @@
+diff --git a/bsd/dev/polaris_spmi.h b/bsd/dev/polaris_spmi.h
+--- a/bsd/dev/polaris_spmi.h
++++ b/bsd/dev/polaris_spmi.h
+@@ -9,6 +9,12 @@
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int polaris_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ int polaris_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++/*
++ * polaris: PMI8998 fg-gen3 / smb2 live on SID 2, not in the PM6150 set that
++ * polaris_spmi_read() allows, so the blocks are dumped through this probe.
++ * Read-only; the registers are logged, nothing is interpreted yet.
++ */
++void polaris_spmi_polaris_probe(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/polaris_spmi.c b/bsd/dev/polaris_spmi.c
+--- a/bsd/dev/polaris_spmi.c
++++ b/bsd/dev/polaris_spmi.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/pexpert.h>
+ #include "polaris_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -24,7 +25,7 @@
+ static vm_offset_t sp_core, sp_obs, sp_cfg;
+ static IOLock *sp_lock;
+ static unsigned sp_count;
+-static bool sp_attempted, sp_ready;
++static bool sp_attempted, sp_ready, sp_polaris;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
+@@ -53,6 +54,37 @@
+ 	return found;
+ }
+ 
++/*
++ * polaris: dump PMI8998 fg-gen3 the way the DTB splits it. The offsets inside
++ * each block are the vendor's; three 32-byte windows are enough to map them
++ * (SOC, voltage and current show up as plausible values).
++ */
++void
++polaris_spmi_polaris_probe(void)
++{
++	static const uint16_t blocks[] = {0x4000, 0x4100, 0x4400};
++	if (polaris_spmi_init() != 0) {
++		printf("POLARIS BATTERY: polaris probe skipped, SPMI not ready\n");
++		return;
++	}
++	for (unsigned b = 0; b < sizeof(blocks) / sizeof(blocks[0]); ++b) {
++		char line[3 * 32 + 1];
++		unsigned n = 0;
++		for (unsigned i = 0; i < 32; ++i) {
++			uint8_t v = 0;
++			if (polaris_spmi_read(2, blocks[b] + i, &v) != 0) {
++				n += snprintf(line + n, sizeof(line) - n, " --");
++			} else {
++				n += snprintf(line + n, sizeof(line) - n, " %02x", v);
++			}
++			if (n >= sizeof(line) - 4) {
++				break;
++			}
++		}
++		printf("POLARIS BATTERY: polaris PMI8998 %#x:%s\n", blocks[b], line);
++	}
++}
++
+ int
+ polaris_spmi_init(void)
+ {
+@@ -80,8 +112,13 @@
+ 		return -1;
+ 	}
+ 	sp_ready = true;
+-	printf("POLARIS BATTERY: SPMI arb=%#x APIDs=%u, observer reads only\n",
+-	    arb_version, sp_count);
++	{
++		int polaris = 0;
++		(void)PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
++		sp_polaris = polaris != 0;
++	}
++	printf("POLARIS BATTERY: SPMI arb=%#x APIDs=%u, observer reads only%s\n",
++	    arb_version, sp_count, sp_polaris ? " (polaris PMI8998 SID 2)" : "");
+ 	return 0;
+ }
+ 
+@@ -90,9 +127,23 @@
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool allowed;
++	if (sp_polaris) {
++		/* PMI8998: fg-batt-soc / fg-batt-info / fg-memif on SID 2, and on
++		 * SID 0 the PM8998 LDO28 block (0x5b00) that feeds the touch avdd. */
++		allowed = (sid == 2 && (peripheral == 0x40 || peripheral == 0x41 ||
++		    peripheral == 0x44)) ||
++		    (sid == 0 && peripheral == 0x5b);
++	} else {
++		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
++		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
++	}
++	/* The touch avdd rail is readable whatever the board flag says; the
++	 * flag only decides which battery blocks are exposed. */
++	if (sid == 0 && peripheral == 0x5b) {
++		allowed = true;
++	}
++	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/PolarisBattery.cpp b/iokit/Kernel/arm/PolarisBattery.cpp
+--- a/iokit/Kernel/arm/PolarisBattery.cpp
++++ b/iokit/Kernel/arm/PolarisBattery.cpp
+@@ -14,6 +14,7 @@
+ #include <pexpert/pexpert.h>
+ /* bsd/dev/polaris_spmi.c */
+ extern "C" int polaris_spmi_init(void);
++extern "C" void polaris_spmi_polaris_probe(void);
+ extern "C" int polaris_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ class PolarisBattery : public IOPMPowerSource {
+@@ -265,6 +266,14 @@
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("polarisbattery", &real, sizeof(real));
+ 	fReal = real == 1 && polaris_spmi_init() == 0;
++	if (fReal) {
++		int polaris = 0;
++		(void)PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
++		if (polaris) {
++			/* Read-only FG dump; the parser lands once the map is known. */
++			polaris_spmi_polaris_probe();
++		}
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {

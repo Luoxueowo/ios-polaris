@@ -1,0 +1,476 @@
+diff --git a/iokit/Kernel/arm/PolarisDisplay.h b/iokit/Kernel/arm/PolarisDisplay.h
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/PolarisDisplay.h
+@@ -0,0 +0,90 @@
++/*
++ * POLARIS: display geometry, shared by PolarisFramebuffer.cpp (what gets copied to
++ * the panel) and hid/PolarisHID.cpp (where a panel touch lands on the presented
++ * display). The two must agree exactly, so the numbers and the mapping live
++ * here instead of in each driver.
++ *
++ * The iOS userland only has status bar and layout data for real iPhone
++ * screens, so the panel is presented as the iPhone X display, 1125x2436
++ * (375x812 points @3x). What the panel actually scans out differs per board:
++ *
++ *   default   1080x2400, 6.67", 395 ppi - 19.5:9, close enough to the
++ *            iPhone X that the centre 1080x2400 of the presentation is
++ *            shown unscaled (polarispanel=0); not the Mi MIX 2S panel.
++ *   polaris  1080x2160, 5.99", 403 ppi - 18:9, so cropping would cut 46
++ *            points off the status bar and the home indicator. The whole
++ *            presentation is scaled by height instead: 998x2160, which is
++ *            62.9x136.1 mm against the iPhone X's 62.4x135.1 mm, with black
++ *            bars on the sides. Boot-arg polarispanel=1 selects this; the
++ *            framebuffer and the touch driver read the same argument, so they
++ *            cannot disagree about the mapping.
++ */
++#ifndef _IOKIT_POLARIS_DISPLAY_H_
++#define _IOKIT_POLARIS_DISPLAY_H_
++
++#include <stdint.h>
++
++#define POLARIS_DISPLAY_LOGICAL_W         1125    /* iPhone X, 375x812 pt @3x */
++#define POLARIS_DISPLAY_LOGICAL_H         2436
++#define POLARIS_DISPLAY_PANEL_W           1080
++/* The 1080x2400 19.5:9 panel; only the native (unscaled) path uses it. */
++#define POLARIS_DISPLAY_ALT_H             2400
++#define POLARIS_DISPLAY_POLARIS_H         2160    /* polaris */
++
++struct polaris_display_plan {
++	int32_t contentW, contentH;     /* panel area the presentation fills */
++	int32_t offX, offY;             /* panel origin of the presentation */
++	int32_t scale;                  /* content is scaled, not cropped */
++};
++
++/*
++ * fit=0 shows the centre panelW x panelH of the logical display, which is what
++ * polaris does (the two aspects are 2.6% apart). fit=1 scales the whole logical
++ * display into the panel.
++ *
++ * The whole logical display only fits by height when it is narrower than the
++ * panel, which is the case here (1125/2436 against 1080/2160); any other pair
++ * falls back to the crop mapping, so no rectangle can land outside the panel.
++ */
++static inline __attribute__((__unused__)) struct polaris_display_plan
++polaris_display_plan_make(int32_t logicalW, int32_t logicalH, int32_t panelW, int32_t panelH,
++    int fit)
++{
++	struct polaris_display_plan p;
++
++	p.scale = 0;
++	p.contentW = panelW;
++	p.contentH = panelH;
++	if (fit && (int64_t)logicalW * panelH < (int64_t)panelW * logicalH) {
++		p.contentW = (int32_t)(((int64_t)logicalW * panelH + logicalH / 2) / logicalH);
++		p.contentH = panelH;
++		p.offX = (panelW - p.contentW) / 2;
++		p.offY = 0;
++		p.scale = 1;
++	} else {
++		p.offX = (logicalW - panelW) / 2;
++		p.offY = (logicalH - panelH) / 2;
++	}
++	return p;
++}
++
++/* Panel pixel -> logical (presented) pixel, rounded and clamped. */
++static inline __attribute__((__unused__)) int32_t
++polaris_display_panel_to_logical(int32_t v, int32_t off, int32_t logical, int32_t content)
++{
++	int64_t l;
++
++	if (content <= 0) {
++		return 0;
++	}
++	l = ((int64_t)(v - off) * logical + content / 2) / content;
++	if (l < 0) {
++		return 0;
++	}
++	if (l > logical - 1) {
++		return logical - 1;
++	}
++	return (int32_t)l;
++}
++
++#endif /* _IOKIT_POLARIS_DISPLAY_H_ */
+diff --git a/iokit/Kernel/arm/PolarisFramebuffer.cpp b/iokit/Kernel/arm/PolarisFramebuffer.cpp
+--- a/iokit/Kernel/arm/PolarisFramebuffer.cpp
++++ b/iokit/Kernel/arm/PolarisFramebuffer.cpp
+@@ -35,2 +35,3 @@
+ #include "PolarisSurface.h"
++#include "PolarisDisplay.h"
+ 
+@@ -81,3 +82,1 @@
+-#define POLARIS_FB_LOGICAL_W              1125
+-#define POLARIS_FB_LOGICAL_H              2436
+ #define POLARIS_FB_FORMAT_BGRA            0x42475241
+@@ -103,7 +102,9 @@
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+-	int32_t       fOffX, fOffY;             /* logical origin of the panel */
++	int32_t       fOffX, fOffY;             /* panel origin of the logical display */
++	uint32_t      fContentW, fContentH;     /* panel area the logical display fills */
++	int           fScale;                   /* scale the logical display into the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	PolarisSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -167,15 +168,41 @@
+ 		return false;
+ 	}
+ 	int native = 0;
++	int polaris = 0;
+ 	PE_parse_boot_argn("polarisfb_native", &native, sizeof(native));
++	PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= POLARIS_FB_LOGICAL_W && fHeight <= POLARIS_FB_LOGICAL_H) {
++	if (!native && fWidth <= POLARIS_DISPLAY_LOGICAL_W && fHeight <= POLARIS_DISPLAY_LOGICAL_H) {
+-		fLogicalW = POLARIS_FB_LOGICAL_W;
+-		fLogicalH = POLARIS_FB_LOGICAL_H;
++		fLogicalW = POLARIS_DISPLAY_LOGICAL_W;
++		fLogicalH = POLARIS_DISPLAY_LOGICAL_H;
+ 	}
+-	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+-	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * Polaris is 1080x2160 (18:9); the presentation is the iPhone X, 1125x2436
++	 * (19.5:9). Cropping to the panel, which is what a matching aspect allows
++	 * (the default 1080x2400 panel), would cut 46 points off the status
++	 * bar and the home
++	 * indicator, so scale the whole presentation by height instead: 998x2160,
++	 * 62.9x136.1 mm against the iPhone X's 62.4x135.1 mm, black bars on the
++	 * sides. See PolarisDisplay.h.
++	 */
++	struct polaris_display_plan plan =
++	    polaris_display_plan_make(fLogicalW, fLogicalH, fWidth, fHeight, !native && polaris);
++	{
++		int stretch = 0;
++		(void)PE_parse_boot_argn("polarisstretch", &stretch, sizeof(stretch));
++		if (stretch && plan.scale) {
++			/* Fill the panel instead of leaving 41 px bars: the blit maps the
++			 * whole logical width onto the panel width. */
++			plan.contentW = fWidth;
++			plan.offX = 0;
++		}
++	}
++	fOffX = plan.offX;
++	fOffY = plan.offY;
++	fContentW = plan.contentW;
++	fContentH = plan.contentH;
++	fScale = plan.scale;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = polaris_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, POLARIS_FB_FORMAT_BGRA);
+@@ -187,6 +214,16 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	if (fScale) {
++		/*
++		 * The bootloader splash is not scaled. Blank the whole panel once, so the
++		 * bars and everything outside the content rect start black; from here on
++		 * the scaler only ever writes inside the content rect.
++		 */
++		for (uint32_t y = 0; y < fHeight; y++) {
++			memset((void *)(fPixels + (uint64_t)y * fRowBytes), 0, (size_t)fRowBytes);
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("POLARIS FB: no vsync timer\n");
+@@ -203,5 +240,7 @@
+ 	registerService();
+ 	IOLog("POLARIS FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("POLARIS FB: %s %ux%u at %d,%d of %ux%u\n", fScale ? "scaling to" : "cropping at",
++	    fContentW, fContentH, fOffX, fOffY, fWidth, fHeight);
+ 	return true;
+ }
+@@ -356,22 +395,33 @@
+ 		if (sx < 0 || sy < 0) {
+ 			sx = sy = 0;
+ 		}
+-		if (dx < 0 || dy < 0) {
+-			dx = dy = 0;
+-		}
+-		/* Logical (presented) display coordinates -> panel coordinates. */
+-		dx -= fOffX;
+-		dy -= fOffY;
+-		if (dx < 0) {
+-			sx -= dx;
+-			w += dx;
+-			dx = 0;
+-		}
+-		if (dy < 0) {
+-			sy -= dy;
+-			h += dy;
+-			dy = 0;
+-		}
++		if (dx < 0 || dy < 0) {
++			dx = dy = 0;
++		}
++		if (!fScale) {
++			/* Logical (presented) display coordinates -> panel coordinates. */
++			dx -= fOffX;
++			dy -= fOffY;
++		}
++		if (dx < 0) {
++			sx -= dx;
++			w += dx;
++			dx = 0;
++		}
++		if (dy < 0) {
++			sy -= dy;
++			h += dy;
++			dy = 0;
++		}
++		if (fScale) {
++			/* The swap rectangles stay in logical display pixels. */
++			if (dx + w > (int32_t)fLogicalW) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (dy + h > (int32_t)fLogicalH) {
++				h = (int32_t)fLogicalH - dy;
++			}
++		}
+ 		if (w > (int32_t)s->width - sx) {
+ 			w = (int32_t)s->width - sx;
+ 		}
+@@ -378,11 +428,13 @@
+ 		if (h > (int32_t)s->height - sy) {
+ 			h = (int32_t)s->height - sy;
+ 		}
+-		if (w > (int32_t)fWidth - dx) {
+-			w = (int32_t)fWidth - dx;
+-		}
+-		if (h > (int32_t)fHeight - dy) {
+-			h = (int32_t)fHeight - dy;
+-		}
++		if (!fScale) {
++			if (w > (int32_t)fWidth - dx) {
++				w = (int32_t)fWidth - dx;
++			}
++			if (h > (int32_t)fHeight - dy) {
++				h = (int32_t)fHeight - dy;
++			}
++		}
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+@@ -390,7 +442,92 @@
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+-		if (src != 0 && bpe == 4) {
++		if (src != 0 && bpe == 4 && fScale) {
++			/*
++			 * Scale the logical rectangle into the content area: nearest
++			 * neighbour across, rounded rather than truncated so the last logical
++			 * column is reached, and a two-row blend down, which is what keeps an
++			 * 11% downscale from dropping whole rows of text (2160 panel rows for
++			 * 2436 logical ones). Only the content rect is written; the bars keep
++			 * the black start() painted.
++			 */
++			int32_t px0 = fOffX + (int32_t)(((int64_t)dx * fContentW) / fLogicalW);
++			int32_t py0 = fOffY + (int32_t)(((int64_t)dy * fContentH) / fLogicalH);
++			int32_t px1 = fOffX + (int32_t)(((int64_t)(dx + w) * fContentW) / fLogicalW);
++			int32_t py1 = fOffY + (int32_t)(((int64_t)(dy + h) * fContentH) / fLogicalH);
++			const uint64_t xstep = ((uint64_t)fLogicalW << 16) / fContentW;
++			const uint64_t ystep = ((uint64_t)fLogicalH << 16) / fContentH;
++			uint64_t ypos, xpos;
++			int32_t py, px, lx, ly, ly2, syy, syy2;
++			uint32_t fy, a, b, lo, hi;
++			const uint32_t *srow, *srow2;
++			uint32_t *drow;
++			if (px0 < fOffX) {
++				px0 = fOffX;
++			}
++			if (py0 < fOffY) {
++				py0 = fOffY;
++			}
++			if (px1 > fOffX + (int32_t)fContentW) {
++				px1 = fOffX + (int32_t)fContentW;
++			}
++			if (py1 > fOffY + (int32_t)fContentH) {
++				py1 = fOffY + (int32_t)fContentH;
++			}
++			if (px1 > (int32_t)fWidth) {
++				px1 = (int32_t)fWidth;
++			}
++			if (py1 > (int32_t)fHeight) {
++				py1 = (int32_t)fHeight;
++			}
++			/* A logical rectangle can be smaller than one panel pixel. */
++			if (px1 <= px0) {
++				px1 = px0 + 1;
++			}
++			if (py1 <= py0) {
++				py1 = py0 + 1;
++			}
++			ypos = (uint64_t)(py0 - fOffY) * ystep;
++			for (py = py0; py < py1; py++, ypos += ystep) {
++				ly = (int32_t)(ypos >> 16);
++				if (ly < dy) {
++					ly = dy;
++				} else if (ly >= dy + h) {
++					ly = dy + h - 1;
++				}
++				ly2 = ly + 1;
++				fy = (uint32_t)((ypos >> 8) & 0xff);
++				syy = sy + ly - dy;
++				syy2 = sy + ly2 - dy;
++				if (fy == 0 || syy2 >= sy + h) {
++					syy2 = syy;
++					fy = 0;
++				}
++				drow = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes);
++				srow = (const uint32_t *)(src + s->offset + (uint64_t)syy * s->bytesPerRow);
++				srow2 = (const uint32_t *)(src + s->offset + (uint64_t)syy2 * s->bytesPerRow);
++				xpos = (uint64_t)(px0 - fOffX) * xstep;
++				for (px = px0; px < px1; px++, xpos += xstep) {
++					lx = (int32_t)((xpos + 0x8000) >> 16);
++					if (lx < dx) {
++						lx = dx;
++					} else if (lx >= dx + w) {
++						lx = dx + w - 1;
++					}
++					a = srow[sx + lx - dx];
++					if (fy == 0) {
++						drow[px] = a;
++						continue;
++					}
++					b = srow2[sx + lx - dx];
++					lo = (((a & 0x00ff00ffu) * (256 - fy) + (b & 0x00ff00ffu) * fy) >> 8) &
++					    0x00ff00ffu;
++					hi = ((((a & 0xff00ff00u) >> 8) * (256 - fy) +
++					    ((b & 0xff00ff00u) >> 8) * fy) >> 8) & 0x00ff00ffu;
++					drow[px] = lo | (hi << 8);
++				}
++			}
++		} else if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+diff --git a/iokit/Kernel/arm/hid/PolarisHID.cpp b/iokit/Kernel/arm/hid/PolarisHID.cpp
+--- a/iokit/Kernel/arm/hid/PolarisHID.cpp
++++ b/iokit/Kernel/arm/hid/PolarisHID.cpp
+@@ -21,5 +21,6 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include "../PolarisDisplay.h"
+ 
+ #include "IOHIDEventService.h"
+@@ -368,6 +369,7 @@
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH, fContentW, fContentH, fScale;
+ 	bool fDown[POLARIS_TOUCH_FINGERS];
+ 	bool fEdge[POLARIS_TOUCH_FINGERS];
+ 	IOFixed fX[POLARIS_TOUCH_FINGERS];
+ 	IOFixed fY[POLARIS_TOUCH_FINGERS];
+@@ -433,11 +435,41 @@
+ 	int native = 0;
++	int polaris = 0;
+ 	PE_parse_boot_argn("polarisfb_native", &native, sizeof(native));
++	PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	fLogicalW = native ? POLARIS_DISPLAY_PANEL_W : POLARIS_DISPLAY_LOGICAL_W;
++	fLogicalH = native ? (polaris ? POLARIS_DISPLAY_POLARIS_H : POLARIS_DISPLAY_ALT_H)
++	    : POLARIS_DISPLAY_LOGICAL_H;
++	fPanelW = POLARIS_DISPLAY_PANEL_W;
++	fPanelH = polaris ? POLARIS_DISPLAY_POLARIS_H : POLARIS_DISPLAY_ALT_H;
++	/*
++	 * Same plan the framebuffer uses: it maps the logical display onto the
++	 * panel, this maps the panel back. polarispanel=1 describes the panel
++	 * as well as the mapping, so it must only be set on polaris.
++	 */
++	struct polaris_display_plan plan =
++	    polaris_display_plan_make(fLogicalW, fLogicalH, fPanelW, fPanelH, !native && polaris);
++	{
++		int stretch = 0;
++		(void)PE_parse_boot_argn("polarisstretch", &stretch, sizeof(stretch));
++		if (stretch && plan.scale) {
++			/* Same geometry as the framebuffer, or touches land off target. */
++			plan.contentW = fPanelW;
++			plan.offX = 0;
++		}
++	}
++	fOffX = plan.offX;
++	fOffY = plan.offY;
++	fContentW = plan.contentW;
++	fContentH = plan.contentH;
++	fScale = plan.scale;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
++	/*
++	 * Physical size of the presented area, 16.16 mm. Polaris is 1080x2160 at
++	 * 403 ppi and the presentation covers 998x2160 of it, so 62.9x136.1 mm -
++	 * the iPhone X (62.4x135.1 mm) to within a percent, which keeps the point
++	 * size and the layout density of a real iPhone X. The unscaled path is
++	 */
+-	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceWidth", (unsigned long long)((fScale ? 63 : 68) << 16), 32);
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)((fPanelH >= 2400 ? 151 : 136) << 16), 32);
+ 	gPolarisTouch = this;
+@@ -458,20 +490,50 @@
+ 	if (finger < 0 || finger >= POLARIS_TOUCH_FINGERS) {
+ 		return;
+ 	}
++	if (fLogicalW <= 0 || fLogicalH <= 0 || fPanelW <= 0 || fPanelH <= 0) {
++		/* touch() can run before start() when the panel is not configured. */
++		return;
++	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
++	if (fScale && (x < fOffX || x >= fOffX + fContentW)) {
++		/*
++		 * Letterbox bar: the framebuffer draws nothing there. A touch that
++		 * starts on a bar is not reported at all, otherwise a finger resting
++		 * on the black edge becomes a touch pinned to the display edge and can
++		 * trip an edge swipe. A finger that slides into a bar is pinned to the
++		 * nearest edge instead, so it keeps being tracked and its release is
++		 * still seen.
++		 */
++		if (!was) {
++			IOLockUnlock(fLock);
++			return;
++		}
++		x = x < fOffX ? fOffX : fOffX + fContentW - 1;
++	}
+ 	/* Panel pixels -> the presented 1125x2436 display (PolarisFramebuffer.cpp). */
+-	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+-	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	int64_t lx, ly;
++	if (fScale) {
++		lx = polaris_display_panel_to_logical(x, fOffX, fLogicalW, fContentW);
++		ly = polaris_display_panel_to_logical(y, fOffY, fLogicalH, fContentH);
++	} else {
++		/* Cropping: the panel sits at fOffX,fOffY inside the logical display. */
++		lx = x + fOffX;
++		ly = y + fOffY;
++		lx = lx < 0 ? 0 : (lx > fLogicalW - 1 ? fLogicalW - 1 : lx);
++		ly = ly < 0 ? 0 : (ly > fLogicalH - 1 ? fLogicalH - 1 : ly);
++	}
++	IOFixed nx = (IOFixed)((lx << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)((ly << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < POLARIS_TOUCH_EDGE_PX || x > 1079 - POLARIS_TOUCH_EDGE_PX ||
+-		    y < POLARIS_TOUCH_EDGE_PX || y > 2399 - POLARIS_TOUCH_EDGE_PX;
++		fEdge[finger] = x < POLARIS_TOUCH_EDGE_PX || x > fPanelW - 1 - POLARIS_TOUCH_EDGE_PX ||
++		    y < POLARIS_TOUCH_EDGE_PX || y > fPanelH - 1 - POLARIS_TOUCH_EDGE_PX;
+ 	}

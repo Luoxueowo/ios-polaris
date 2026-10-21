@@ -1,0 +1,123 @@
+diff --git a/bsd/dev/polaris_keys.c b/bsd/dev/polaris_keys.c
+--- a/bsd/dev/polaris_keys.c
++++ b/bsd/dev/polaris_keys.c
+@@ -21,11 +21,26 @@
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++#define KEYS_GPIO_PPID   0x04c1u        /* PM6150L GPIO2: SID 4, base 0xc100 */
++#define KEYS_GPIO_RT     0x10u          /* RT_STS inside that peripheral */
+ #define KEYS_NO_APID     0xffffu
++/*
++ * polaris: PM8998 GPIO6. Linux' pinctrl-spmi-gpio puts pin N at
++ * reg + 0x100 * (N - 1) with reg = 0xc000 and counts the device tree cell
++ * from one, so GPIO6 lives at 0xc500. The SPMI peripheral is one 0x100 block
++ * (keys_read() can only put 8 address bits on the wire) and PPID is
++ * (SID << 8) | block, which gives 0x0c5 - the same arithmetic that turns
++ * sweet's 0x4c1 into GPIO2 at 0xc100.
++ */
++#define KEYS_POLARIS_GPIO_PPID 0x00c5u
++#define KEYS_GPIO_RT_OFF 0x10u
++#define KEYS_GPIO_SUBTYPE(s) ((s) >= 0x10u && (s) <= 0x13u)
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_gpio_rt = KEYS_GPIO_RT;
++static bool keys_polaris;
++static uint8_t keys_last_vol = 0xffu;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -100,7 +115,12 @@
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++		bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
++		if (gok && gpio != keys_last_vol) {
++			printf("POLARIS KEYS: vol byte %#x -> %#x (changed bits %#x)\n",
++			    keys_last_vol, gpio, keys_last_vol ^ gpio);
++			keys_last_vol = gpio;
++		}
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+ 		if (!pok || !gok) {
+ 			if ((errors++ % 250u) == 0) {
+@@ -113,7 +133,7 @@
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("POLARIS KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("POLARIS KEYS: key=%d down=%d pon=%#x vol=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				polaris_hid_key(k, state[k]);
+ 			}
+@@ -135,6 +155,12 @@
+ 	if (!enabled) {
+ 		printf("POLARIS KEYS: disabled (polariskeys=0)\n");
+ 		return;
++	}
++	{
++		int polaris = 0;
++		(void)PE_parse_boot_argn("polarispanel", &polaris, sizeof(polaris));
++		/* The flag that selects the polaris panel selects its keys too. */
++		keys_polaris = polaris != 0;
+ 	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+@@ -152,20 +178,51 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	if (keys_polaris) {
++		uint16_t ppid = KEYS_POLARIS_GPIO_PPID;
++		int forced = 0;
++		if (PE_parse_boot_argn("polariskeyppid", &forced, sizeof(forced)) &&
++		    forced > 0 && forced < 0x1000) {
++			ppid = (uint16_t)forced;
++			printf("POLARIS KEYS: ppid forced to %#x\n", ppid);
++		}
++		keys_gpio_apid = keys_find_apid(ppid, count);
++		keys_gpio_rt = KEYS_GPIO_RT_OFF;
++		printf("POLARIS KEYS: vol_up ppid=%#x apid=%u\n", ppid, keys_gpio_apid);
++		if (keys_gpio_apid == KEYS_NO_APID) {
++			/*
++			 * The deduction was wrong or the PPID is not in the table; show
++			 * every peripheral that looks like a GPIO so the real one is
++			 * visible rather than guessed again.
++			 */
++			for (uint32_t i = 0; i < count; ++i) {
++				uint32_t map = keys_rd(keys_core, 0x900u + 4u * i);
++				uint8_t st = 0;
++				if (map == 0 || !keys_read((uint16_t)i, 0x05, &st) ||
++				    !KEYS_GPIO_SUBTYPE(st)) {
++					continue;
++				}
++				printf("POLARIS KEYS: gpio-like apid=%u ppid=%#x subtype=%#x\n",
++				    i, (uint16_t)((map >> 8) & 0xfffu), st);
++			}
++		}
++	} else {
++		keys_gpio_apid = keys_find_apid(KEYS_GPIO_PPID, count);
++	}
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+-	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
++	bool gok = keys_read(keys_gpio_apid, keys_gpio_rt, &gpio);
+ 	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+ 	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("POLARIS KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	printf("POLARIS KEYS: arb=%#x apids=%u pon-apid=%u gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
++	if (!keys_polaris && (!eok || !mok || !sok || !(en & 0x80u) ||
++	    (dir != 0 && dir != 2))) {
+ 		printf("POLARIS KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
